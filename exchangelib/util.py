@@ -2,6 +2,7 @@ from __future__ import unicode_literals
 
 from base64 import b64decode
 from codecs import BOM_UTF8
+from collections import OrderedDict
 import datetime
 from decimal import Decimal
 import io
@@ -10,11 +11,12 @@ import logging
 import re
 import socket
 import time
-import xml.sax.expatreader
 import xml.sax.handler
 
 # Import _etree via defusedxml instead of directly from lxml.etree, to silence overly strict linters
 from defusedxml.lxml import parse, tostring, GlobalParserTLS, RestrictedElement, _etree
+from defusedxml.expatreader import DefusedExpatParser
+from defusedxml.sax import _InputSource
 from future.backports.misc import get_ident
 from future.moves.urllib.parse import urlparse
 from future.utils import PY2
@@ -52,11 +54,11 @@ MNS = 'http://schemas.microsoft.com/exchange/services/2006/messages'
 TNS = 'http://schemas.microsoft.com/exchange/services/2006/types'
 ENS = 'http://schemas.microsoft.com/exchange/services/2006/errors'
 
-ns_translation = {
-    's': SOAPNS,
-    't': TNS,
-    'm': MNS,
-}
+ns_translation = OrderedDict([
+    ('s', SOAPNS),
+    ('m', MNS),
+    ('t', TNS),
+])
 for item in ns_translation.items():
     _etree.register_namespace(*item)
 
@@ -225,12 +227,13 @@ def safe_xml_value(value, replacement='?'):
     return text_type(_ILLEGAL_XML_CHARS_RE.sub(replacement, value))
 
 
-def create_element(name, **attrs):
-    # copy.deepcopy() is an order of magnitude faster than creating a new Element() every time
+def create_element(name, attrs=None, nsmap=None):
+    # Python versions prior to 3.6 do not preserve dict or kwarg ordering, so we cannot pull in attrs as **kwargs if we
+    # also want stable XML attribute output. Instead, let callers supply us with an OrderedDict instance.
     if ':' in name:
         ns, name = name.split(':')
         name = '{%s}%s' % (ns_translation[ns], name)
-    elem = RestrictedElement(**attrs)
+    elem = RestrictedElement(attrib=attrs, nsmap=nsmap)
     elem.tag = name
     return elem
 
@@ -269,10 +272,18 @@ class StreamingContentHandler(xml.sax.handler.ContentHandler):
         self._parser.buffer.append(content)
 
 
-class StreamingBase64Parser(xml.sax.expatreader.ExpatParser):
+def prepare_input_source(source):
+    # Extracted from xml.sax.expatreader.saxutils.prepare_input_source
+    f = source
+    source = _InputSource()
+    source.setByteStream(f)
+    return source
+
+
+class StreamingBase64Parser(DefusedExpatParser):
     """A SAX parser that returns a generator of base64-decoded character content"""
     def __init__(self, *args, **kwargs):
-        xml.sax.expatreader.ExpatParser.__init__(self, *args, **kwargs)
+        DefusedExpatParser.__init__(self, *args, **kwargs)
         self._namespaces = True
         self.buffer = None
         self.element_found = None
@@ -280,7 +291,7 @@ class StreamingBase64Parser(xml.sax.expatreader.ExpatParser):
     def parse(self, source):
         raw_source = source.raw
         # Like upstream but yields the return value of self.feed()
-        raw_source = xml.sax.expatreader.saxutils.prepare_input_source(raw_source)
+        raw_source = prepare_input_source(raw_source)
         self.prepareParser(raw_source)
         file = raw_source.getByteStream()
         self.buffer = []
@@ -305,7 +316,7 @@ class StreamingBase64Parser(xml.sax.expatreader.ExpatParser):
 
     def feed(self, data, isFinal=0):
         # Like upstream, but yields the current content of the character buffer
-        xml.sax.expatreader.ExpatParser.feed(self, data=data, isFinal=isFinal)
+        DefusedExpatParser.feed(self, data=data, isFinal=isFinal)
         return self._decode_buffer()
 
     def _decode_buffer(self):

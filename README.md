@@ -584,6 +584,11 @@ qs.filter(categories__exists=True)
 # server.
 qs.filter(categories__exists=False)
 
+# WARNING: Filtering on the 'body' field is not fully supported by EWS. There seems to be a window
+# before some internal search index is populated where case-sensitive or case-insensitive filtering
+# for substrings in the body element incorrectly returns an empty result, and sometimes the result
+# stays empty.
+
 # filter() also supports EWS QueryStrings. Just pass the string to filter(). QueryStrings cannot
 # be combined with other filters. We make no attempt at validating the syntax of the QueryString 
 # - we just pass the string verbatim to EWS.
@@ -651,7 +656,7 @@ a = Account(...)
 qs = a.inbox.all().only('mime_content')
 qs.page_size = 5
 for msg in qs.iterator():
-    with open('%s.eml' % msg.item_id, 'wb') as f:
+    with open('%s.eml' % msg.item_id, 'w') as f:
         f.write(msg.mime_content)
 ```
 

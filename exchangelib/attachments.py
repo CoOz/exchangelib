@@ -26,7 +26,7 @@ class AttachmentId(EWSElement):
         IdField('root_changekey', field_uri=ROOT_CHANGEKEY_ATTR),
     ]
 
-    __slots__ = ('id', 'root_id', 'root_changekey')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class Attachment(EWSElement):
@@ -44,8 +44,7 @@ class Attachment(EWSElement):
         BooleanField('is_inline', field_uri='IsInline'),
     ]
 
-    __slots__ = ('parent_item', 'attachment_id', 'name', 'content_type', 'content_id', 'content_location', 'size',
-                 'last_modified_time', 'is_inline')
+    __slots__ = tuple(f.name for f in FIELDS) + ('parent_item',)
 
     def __init__(self, **kwargs):
         self.parent_item = kwargs.pop('parent_item', None)
@@ -112,12 +111,12 @@ class Attachment(EWSElement):
     def __hash__(self):
         if self.attachment_id:
             return hash(self.attachment_id)
-        return hash(tuple(getattr(self, f) for f in self.__slots__[1:]))
+        # Be careful to avoid recursion on the back-reference to the parent item
+        return hash(tuple(getattr(self, f) for f in self.__slots__ if f != 'parent_item'))
 
     def __repr__(self):
         return self.__class__.__name__ + '(%s)' % ', '.join(
-            '%s=%s' % (f.name, repr(getattr(self, f.name))) for f in self.FIELDS
-            if f.name not in ('_item', '_content')
+            '%s=%r' % (f.name, getattr(self, f.name)) for f in self.FIELDS if f.name not in ('_item', '_content')
         )
 
 
@@ -131,7 +130,7 @@ class FileAttachment(Attachment):
         Base64Field('_content', field_uri='Content'),
     ]
 
-    __slots__ = Attachment.__slots__ + ('is_contact_photo', '_content', '_fp')
+    __slots__ = tuple(f.name for f in FIELDS) + ('parent_item', '_fp')
 
     def __init__(self, **kwargs):
         kwargs['_content'] = kwargs.pop('content', None)
@@ -206,7 +205,7 @@ class ItemAttachment(Attachment):
         ItemField('_item', field_uri='Item'),
     ]
 
-    __slots__ = Attachment.__slots__ + ('_item',)
+    __slots__ = tuple(f.name for f in FIELDS) + ('parent_item',)
 
     def __init__(self, **kwargs):
         kwargs['_item'] = kwargs.pop('item', None)

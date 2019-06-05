@@ -3,6 +3,7 @@ from __future__ import unicode_literals
 import abc
 import base64
 import binascii
+from collections import OrderedDict
 import datetime
 from decimal import Decimal, InvalidOperation
 import logging
@@ -233,7 +234,7 @@ class FieldOrder(object):
         )
 
     def to_xml(self):
-        field_order = create_element('t:FieldOrder', Order='Descending' if self.reverse else 'Ascending')
+        field_order = create_element('t:FieldOrder', attrs=dict(Order='Descending' if self.reverse else 'Ascending'))
         field_order.append(self.field_path.to_xml())
         return field_order
 
@@ -294,7 +295,7 @@ class Field(object):
                 raise ValueError("Field '%s' value %r must be a list" % (self.name, value))
             for v in value:
                 if not isinstance(v, self.value_cls):
-                    raise TypeError('Field %s value "%r must be of type %s' % (self.name, v, self.value_cls))
+                    raise TypeError("Field '%s' value %r must be of type %s" % (self.name, v, self.value_cls))
                 if hasattr(v, 'clean'):
                     v.clean(version=version)
         else:
@@ -365,7 +366,7 @@ class FieldURIField(Field):
     def field_uri_xml(self):
         if not self.field_uri:
             raise ValueError("'field_uri' value is missing")
-        return create_element('t:FieldURI', FieldURI=self.field_uri)
+        return create_element('t:FieldURI', attrs=dict(FieldURI=self.field_uri))
 
     def request_tag(self):
         if not self.field_uri_postfix:
@@ -413,14 +414,14 @@ class IntegerField(FieldURIField):
                 for v in value:
                     if self.min is not None and v < self.min:
                         raise ValueError(
-                            "value '%s' on field '%s' must be greater than %s" % (value, self.name, self.min))
+                            "Value %r on field '%s' must be greater than %s" % (v, self.name, self.min))
                     if self.max is not None and v > self.max:
-                        raise ValueError("value '%s' on field '%s' must be less than %s" % (value, self.name, self.max))
+                        raise ValueError("Value %r on field '%s' must be less than %s" % (v, self.name, self.max))
             else:
                 if self.min is not None and value < self.min:
-                    raise ValueError("value '%s' on field '%s' must be greater than %s" % (value, self.name, self.min))
+                    raise ValueError("Value %r on field '%s' must be greater than %s" % (value, self.name, self.min))
                 if self.max is not None and value > self.max:
-                    raise ValueError("value '%s' on field '%s' must be less than %s" % (value, self.name, self.max))
+                    raise ValueError("Value %r on field '%s' must be less than %s" % (value, self.name, self.max))
         return value
 
     def from_xml(self, elem, account):
@@ -471,6 +472,14 @@ class EnumField(IntegerField):
                 value = self.enum.index(value) + 1
         return super(EnumField, self).clean(value, version=version)
 
+    def as_string(self, value):
+        # Converts an integer in the enum to its equivalent string
+        if isinstance(value, string_types):
+            return value
+        if self.is_list:
+            return [self.enum[v - 1] for v in sorted(value)]
+        return self.enum[value - 1]
+
     def from_xml(self, elem, account):
         val = self._get_val_from_elem(elem)
         if val is not None:
@@ -486,8 +495,8 @@ class EnumField(IntegerField):
     def to_xml(self, value, version):
         field_elem = create_element(self.request_tag())
         if self.is_list:
-            return set_xml_value(field_elem, ' '.join(self.enum[v - 1] for v in sorted(value)), version=version)
-        return set_xml_value(field_elem, self.enum[value - 1], version=version)
+            return set_xml_value(field_elem, ' '.join(self.as_string(value)), version=version)
+        return set_xml_value(field_elem, self.as_string(value), version=version)
 
 
 class EnumListField(EnumField):
@@ -533,6 +542,28 @@ class Base64Field(FieldURIField):
     def to_xml(self, value, version):
         field_elem = create_element(self.request_tag())
         return set_xml_value(field_elem, base64.b64encode(value).decode('ascii'), version=version)
+
+
+class MimeContentField(Base64Field):
+    # EWS: https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/mimecontent
+    value_cls = string_types[0]
+    default_encoding = 'utf-8'
+
+    def from_xml(self, elem, account):
+        val = super(MimeContentField, self).from_xml(elem=elem, account=account)
+        if val is None or val == self.default:
+            # Return default values unaltered
+            return val
+
+        charset = elem.find(self.response_tag()).get('CharacterSet').lower() or self.default_encoding
+        try:
+            return val.decode(charset)
+        except UnicodeDecodeError:
+            log.warning("Cannot decode value '%s' on field '%s' to charset %s", val, self.name, self.value_cls)
+            return None
+
+    def to_xml(self, value, version):
+        return super(MimeContentField, self).to_xml(value=value.encode(self.default_encoding), version=version)
 
 
 class DateField(FieldURIField):
@@ -616,7 +647,13 @@ class TimeZoneField(FieldURIField):
         return self.default
 
     def to_xml(self, value, version):
-        return create_element('t:%s' % self.field_uri_postfix, Id=value.ms_id, Name=value.ms_name)
+        return create_element(
+            't:%s' % self.field_uri_postfix,
+            attrs=OrderedDict([
+                ('Id', value.ms_id),
+                ('Name', value.ms_name),
+            ])
+        )
 
 
 class TextField(FieldURIField):
@@ -681,10 +718,13 @@ class IdField(CharField):
 class CharListField(CharField):
     is_list = True
 
+    def list_elem_tag(self):
+        return '{%s}String' % self.namespace
+
     def from_xml(self, elem, account):
         iter_elem = elem.find(self.response_tag())
         if iter_elem is not None:
-            return get_xml_attrs(iter_elem, '{%s}String' % TNS)
+            return get_xml_attrs(iter_elem, self.list_elem_tag())
         return self.default
 
 
@@ -737,7 +777,7 @@ class ChoiceField(CharField):
             value, self.name, ', '.join(self.supported_choices(version=version))))
 
     def supported_choices(self, version=None):
-        return {c.value for c in self.choices if c.supports_version(version)}
+        return list(c.value for c in self.choices if c.supports_version(version))
 
 
 FREE_BUSY_CHOICES = [Choice('Free'), Choice('Tentative'), Choice('Busy'), Choice('OOF'), Choice('NoData'),
@@ -887,7 +927,12 @@ class BaseEmailField(EWSElementField):
         if sub_elem is not None:
             if self.field_uri is not None:
                 # We want the nested Mailbox, not the wrapper element
-                return self.value_cls.from_xml(elem=sub_elem.find(self.value_cls.response_tag()), account=account)
+                nested_elem = sub_elem.find(self.value_cls.response_tag())
+                if nested_elem is None:
+                    raise ValueError(
+                        'Expected XML element %r missing on field %r' % (self.value_cls.response_tag(), self.name)
+                    )
+                return self.value_cls.from_xml(elem=nested_elem, account=account)
             return self.value_cls.from_xml(elem=sub_elem, account=account)
         return self.default
 
@@ -971,7 +1016,7 @@ class AttachmentField(EWSElementListField):
         # Look for both FileAttachment and ItemAttachment
         if iter_elem is not None:
             attachments = []
-            for att_type in (FileAttachment, ItemAttachment):
+            for att_type in (ItemAttachment, FileAttachment):
                 attachments.extend(
                     [att_type.from_xml(elem=e, account=account) for e in iter_elem.findall(att_type.response_tag())]
                 )
@@ -1003,7 +1048,13 @@ class SubField(Field):
 
     @staticmethod
     def field_uri_xml(field_uri, label):
-        return create_element('t:IndexedFieldURI', FieldURI=field_uri, FieldIndex=label)
+        return create_element(
+            't:IndexedFieldURI',
+            attrs=OrderedDict([
+                ('FieldURI', field_uri),
+                ('FieldIndex', label),
+            ])
+        )
 
     def __hash__(self):
         return hash(self.name)
@@ -1039,7 +1090,13 @@ class NamedSubField(SubField):
         return set_xml_value(field_elem, value, version=version)
 
     def field_uri_xml(self, field_uri, label):
-        return create_element('t:IndexedFieldURI', FieldURI='%s:%s' % (field_uri, self.field_uri), FieldIndex=label)
+        return create_element(
+            't:IndexedFieldURI',
+            attrs=OrderedDict([
+                ('FieldURI', '%s:%s' % (field_uri, self.field_uri)),
+                ('FieldIndex', label),
+            ])
+        )
 
     def request_tag(self):
         return 't:%s' % self.field_uri
@@ -1204,6 +1261,20 @@ class ItemField(FieldURIField):
     def to_xml(self, value, version):
         # We don't want to wrap in an Item element
         return value.to_xml(version=version)
+
+
+class UnknownEntriesField(CharListField):
+    def list_elem_tag(self):
+        return '{%s}UnknownEntry' % self.namespace
+
+
+class PermissionSetField(EWSElementField):
+    is_complex = True
+
+    def __init__(self, *args, **kwargs):
+        from .properties import PermissionSet
+        kwargs['value_cls'] = PermissionSet
+        super(PermissionSetField, self).__init__(*args, **kwargs)
 
 
 class EffectiveRightsField(EWSElementField):

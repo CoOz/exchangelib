@@ -1,6 +1,7 @@
 # coding=utf-8
 from __future__ import unicode_literals
 
+from copy import deepcopy
 from fnmatch import fnmatch
 import logging
 from operator import attrgetter
@@ -12,13 +13,13 @@ from six import text_type, string_types
 
 from .errors import ErrorAccessDenied, ErrorFolderNotFound, ErrorCannotEmptyFolder, ErrorCannotDeleteObject, \
     ErrorNoPublicFolderReplicaAvailable, ErrorInvalidOperation, ErrorDeleteDistinguishedFolder, ErrorItemNotFound
-from .fields import IntegerField, TextField, DateTimeField, FieldPath, EffectiveRightsField, MailboxField, IdField, \
-    EWSElementField, Field
+from .fields import IntegerField, CharField, DateTimeField, FieldPath, EffectiveRightsField, MailboxField, IdField, \
+    PermissionSetField, EWSElementField, Field
 from .items import Item, CalendarItem, Contact, Message, Task, MeetingRequest, MeetingResponse, MeetingCancellation, \
     DistributionList, RegisterMixIn, Persona, ITEM_CLASSES, ITEM_TRAVERSAL_CHOICES, SHAPE_CHOICES, ID_ONLY, \
     DELETE_TYPE_CHOICES, HARD_DELETE
 from .properties import ItemId, Mailbox, EWSElement, ParentFolderId, InvalidField
-from .queryset import QuerySet, SearchableMixIn
+from .queryset import QuerySet, SearchableMixIn, DoesNotExist, MultipleObjectsReturned
 from .restriction import Restriction, Q
 from .services import FindFolder, GetFolder, FindItem, CreateFolder, UpdateFolder, DeleteFolder, EmptyFolder, FindPeople
 from .util import TNS, MNS
@@ -50,7 +51,7 @@ class DistinguishedFolderId(ItemId):
         MailboxField('mailbox'),
     ]
 
-    __slots__ = ItemId.__slots__ + ('mailbox',)
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def clean(self, version=None):
         super(DistinguishedFolderId, self).clean(version=version)
@@ -72,7 +73,7 @@ class CalendarView(EWSElement):
         IntegerField('max_items', field_uri='MaxEntriesReturned', min=1, is_attribute=True),
     ]
 
-    __slots__ = ('start', 'end', 'max_items')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def clean(self, version=None):
         super(CalendarView, self).clean(version=version)
@@ -80,7 +81,151 @@ class CalendarView(EWSElement):
             raise ValueError("'start' must be before 'end'")
 
 
+class FolderQuerySet(object):
+    """A QuerySet-like class for finding subfolders of a folder collection
+    """
+    def __init__(self, folder_collection):
+        if not isinstance(folder_collection, FolderCollection):
+            raise ValueError("'folder_collection' %r must be a FolderCollection instance" % folder_collection)
+        self.folder_collection = folder_collection
+        self.only_fields = None
+        self.traversal_depth = None
+        self.q = None
+
+    def _copy_cls(self):
+        return self.__class__(folder_collection=self.folder_collection)
+
+    def copy(self):
+        """Chaining operations must make a copy of self before making any modifications
+        """
+        new_qs = self._copy_cls()
+        new_qs.only_fields = self.only_fields
+        new_qs.traversal_depth = self.traversal_depth
+        new_qs.q = None if self.q is None else deepcopy(self.q)
+        return new_qs
+
+    def only(self, *args):
+        """Restrict the fields returned. 'name' and 'folder_class' are always returned.
+        """
+        all_fields = self.folder_collection.get_folder_fields(is_complex=None)
+        only_fields = []
+        for arg in args:
+            for field_path in all_fields:
+                if field_path.field.name == arg:
+                    only_fields.append(field_path)
+                    break
+            else:
+                raise InvalidField("Unknown field %r on folders %s" % (arg, self.folder_collection.folders))
+        new_qs = self.copy()
+        new_qs.only_fields = only_fields
+        return new_qs
+
+    def depth(self, depth):
+        """Specify the search depth (SHALLOW or DEEP)
+        """
+        if depth not in FOLDER_TRAVERSAL_CHOICES:
+            raise ValueError("'depth' %s must be one of %s" % (depth, FOLDER_TRAVERSAL_CHOICES))
+        new_qs = self.copy()
+        new_qs.traversal_depth = depth
+        return new_qs
+
+    def get(self, *args, **kwargs):
+        """Return the single folder matching the specified filter
+        """
+        if args or kwargs:
+            folders = list(self.filter(*args, **kwargs))
+        else:
+            folders = list(self.all())
+        if not folders:
+            raise DoesNotExist('Could not find a child folder matching the query')
+        if len(folders) != 1:
+            raise MultipleObjectsReturned('Expected result length 1, but got %s' % folders)
+        f = folders[0]
+        if isinstance(f, Exception):
+            raise f
+        return f
+
+    def all(self):
+        """Return all child folders at the depth specified
+        """
+        new_qs = self.copy()
+        return new_qs
+
+    def filter(self, *args, **kwargs):
+        """Add restrictions to the folder search
+        """
+        new_qs = self.copy()
+        q = Q(*args, **kwargs)
+        new_qs.q = q if new_qs.q is None else new_qs.q & q
+        return new_qs
+
+    def __iter__(self):
+        return self._query()
+
+    def _query(self):
+        if self.traversal_depth is None:
+            self.traversal_depth = DEEP
+        if self.only_fields is None:
+            non_complex_fields = self.folder_collection.get_folder_fields(is_complex=False)
+            complex_fields = self.folder_collection.get_folder_fields(is_complex=True)
+        else:
+            non_complex_fields = set(f for f in self.only_fields if not f.field.is_complex)
+            complex_fields = set(f for f in self.only_fields if f.field.is_complex)
+
+        # First, fetch all non-complex fields using FindFolder. We do this because some folders do not support
+        # GetFolder but we still want to get as much information as possible.
+        folders = self.folder_collection.find_folders(
+            q=self.q, depth=self.traversal_depth, additional_fields=non_complex_fields
+        )
+        if not complex_fields:
+            for f in folders:
+                yield f
+            return
+
+        # Fetch all properties for the found folders
+        resolveable_folders = []
+        for f in folders:
+            if not f.get_folder_allowed:
+                log.debug('GetFolder not allowed on folder %s. Non-complex fields must be fetched with FindFolder', f)
+                yield f
+            else:
+                resolveable_folders.append(f)
+
+        # Get the complex fields using GetFolder, for the folders that support it, and add the extra field values
+        complex_folders = FolderCollection(
+            account=self.folder_collection.account, folders=resolveable_folders
+        ).get_folders(additional_fields=complex_fields)
+        for f, complex_f in zip(resolveable_folders, complex_folders):
+            if isinstance(f, Exception):
+                yield f
+                continue
+            if isinstance(complex_f, Exception):
+                yield complex_f
+                continue
+            # Add the extra field values to the folders we fetched with find_folders()
+            if f.__class__ != complex_f.__class__:
+                raise ValueError('Type mismatch: %s vs %s' % (f, complex_f))
+            for complex_field in complex_fields:
+                field_name = complex_field.field.name
+                setattr(f, field_name, getattr(complex_f, field_name))
+            yield f
+
+
+class SingleFolderQuerySet(FolderQuerySet):
+    """A helper class with simpler argument types
+    """
+    def __init__(self, account, folder):
+        folder_collection = FolderCollection(account=account, folders=[folder])
+        super(SingleFolderQuerySet, self).__init__(folder_collection=folder_collection)
+
+    def _copy_cls(self):
+        return self.__class__(account=self.folder_collection.account, folder=self.folder_collection.folders[0])
+
+
 class FolderCollection(SearchableMixIn):
+    # These fields are required in a FindFolder or GetFolder call to properly identify folder types
+    REQUIRED_FOLDER_FIELDS = ('name', 'folder_class')
+
     def __init__(self, account, folders):
         """ Implements a search API on a collection of folders
 
@@ -210,7 +355,6 @@ class FolderCollection(SearchableMixIn):
         if additional_fields:
             for f in additional_fields:
                 self.validate_item_field(field=f)
-            for f in additional_fields:
                 if f.field.is_complex:
                     raise ValueError("find_items() does not support field '%s'. Use fetch() instead" % f.field.name)
         if calendar_view is not None and not isinstance(calendar_view, CalendarView):
@@ -256,20 +400,39 @@ class FolderCollection(SearchableMixIn):
                 else:
                     yield Folder.item_model_from_tag(i.tag).from_xml(elem=i, account=self.account)
 
-    def _get_folder_fields(self):
+    def get_folder_fields(self, is_complex=None):
         additional_fields = set()
         for folder in self.folders:
             if isinstance(folder, Folder):
                 additional_fields.update(
                     FieldPath(field=f) for f in folder.supported_fields(version=self.account.version)
+                    if is_complex is None or f.is_complex is is_complex
                 )
             else:
                 additional_fields.update(
                     FieldPath(field=f) for f in Folder.supported_fields(version=self.account.version)
+                    if is_complex is None or f.is_complex is is_complex
                 )
         return additional_fields
 
-    def find_folders(self, q=None, shape=ID_ONLY, depth=DEEP, page_size=None, max_items=None, offset=0):
+    def resolve(self):
+        # Looks up the folders or folder IDs in the collection and returns full Folder instances with all fields set.
+        resolveable_folders = []
+        for f in self.folders:
+            if not f.get_folder_allowed:
+                log.debug('GetFolder not allowed on folder %s. Non-complex fields must be fetched with FindFolder', f)
+                yield f
+            else:
+                resolveable_folders.append(f)
+        # Fetch all properties for the remaining folders of folder IDs
+        additional_fields = self.get_folder_fields(is_complex=None)
+        for f in self.__class__(account=self.account, folders=resolveable_folders).get_folders(
+                additional_fields=additional_fields
+        ):
+            yield f
+
+    def find_folders(self, q=None, shape=ID_ONLY, depth=DEEP, additional_fields=None, page_size=None, max_items=None,
+                     offset=0):
         # 'depth' controls whether to return direct children or recurse into sub-folders
         if not self.account:
             raise ValueError('Folder must have an account')
@@ -283,27 +446,50 @@ class FolderCollection(SearchableMixIn):
             raise ValueError("'depth' %s must be one of %s" % (depth, FOLDER_TRAVERSAL_CHOICES))
         if not self.folders:
             log.debug('Folder list is empty')
-            return []
-        additional_fields = self._get_folder_fields()
-        return FindFolder(account=self.account, folders=self.folders, chunk_size=page_size).call(
+            return
+        if additional_fields is None:
+            # Default to all non-complex properties
+            additional_fields = self.get_folder_fields(is_complex=False)
+        else:
+            for f in additional_fields:
+                if f.field.is_complex:
+                    raise ValueError("find_folders() does not support field '%s'. Use get_folders()." % f.field.name)
+
+        # Add required fields
+        additional_fields.update(
+            (FieldPath(field=Folder.get_field_by_fieldname(f)) for f in self.REQUIRED_FOLDER_FIELDS)
+        )
+
+        for f in FindFolder(account=self.account, folders=self.folders, chunk_size=page_size).call(
                 additional_fields=additional_fields,
                 restriction=restriction,
                 shape=shape,
                 depth=depth,
                 max_items=max_items,
                 offset=offset,
-        )
+        ):
+            yield f
 
-    def get_folders(self):
+    def get_folders(self, additional_fields=None):
+        # Expand folders with their full set of properties
         if not self.folders:
             log.debug('Folder list is empty')
-            return []
-        additional_fields = self._get_folder_fields()
-        return GetFolder(account=self.account).call(
+            return
+        if additional_fields is None:
+            # Default to all complex properties
+            additional_fields = self.get_folder_fields(is_complex=True)
+
+        # Add required fields
+        additional_fields.update(
+            (FieldPath(field=Folder.get_field_by_fieldname(f)) for f in self.REQUIRED_FOLDER_FIELDS)
+        )
+
+        for f in GetFolder(account=self.account).call(
                 folders=self.folders,
                 additional_fields=additional_fields,
                 shape=ID_ONLY,
-        )
+        ):
+            yield f
 
 
 @python_2_unicode_compatible
@@ -320,6 +506,8 @@ class Folder(RegisterMixIn, SearchableMixIn):
     # Marks the version from which a distinguished folder was introduced. A possibly authoritative source is:
     # https://github.com/OfficeDev/ews-managed-api/blob/master/Enumerations/WellKnownFolderName.cs
     supported_from = None
+    # Whether this folder type is allowed with the GetFolder service
+    get_folder_allowed = True
     LOCALIZED_NAMES = dict()  # A map of (str)locale: (tuple)localized_folder_names
     ITEM_MODEL_MAP = {cls.response_tag(): cls for cls in ITEM_CLASSES}
     FIELDS = [
@@ -327,11 +515,12 @@ class Folder(RegisterMixIn, SearchableMixIn):
         IdField('changekey', field_uri=FolderId.CHANGEKEY_ATTR),
         EWSElementField('parent_folder_id', field_uri='folder:ParentFolderId', value_cls=ParentFolderId,
                         is_read_only=True),
-        TextField('folder_class', field_uri='folder:FolderClass', is_required_after_save=True),
-        TextField('name', field_uri='folder:DisplayName'),
+        CharField('folder_class', field_uri='folder:FolderClass', is_required_after_save=True),
+        CharField('name', field_uri='folder:DisplayName'),
         IntegerField('total_count', field_uri='folder:TotalCount', is_read_only=True),
         IntegerField('child_folder_count', field_uri='folder:ChildFolderCount', is_read_only=True),
         IntegerField('unread_count', field_uri='folder:UnreadCount', is_read_only=True),
+        PermissionSetField('permission_set', field_uri='folder:PermissionSet'),
         EffectiveRightsField('effective_rights', field_uri='folder:EffectiveRights', is_read_only=True),
     ]
 
@@ -785,15 +974,21 @@ class Folder(RegisterMixIn, SearchableMixIn):
         return True
 
     @classmethod
-    def from_xml(cls, elem, root):
-        # fld_type = re.sub('{.*}', '', elem.tag)
+    def from_xml(cls, elem, account):
+        raise NotImplementedError('Use from_xml_with_root() instead')
+
+    @classmethod
+    def from_xml_with_root(cls, elem, root):
+        # If no root is specified, assume the main root hierarchy
         fld_id_elem = elem.find(FolderId.response_tag())
         fld_id = fld_id_elem.get(FolderId.ID_ATTR)
         changekey = fld_id_elem.get(FolderId.CHANGEKEY_ATTR)
+        # Check for 'DisplayName' element before collecting kwargs because because that clears the elements
+        has_name_elem = elem.find(cls.get_field_by_fieldname('name').response_tag()) is not None
         kwargs = {f.name: f.from_xml(elem=elem, account=root.account) for f in cls.supported_fields()}
-        if not kwargs['name']:
-            # Some folders are returned with an empty 'DisplayName' element. Assign a default name to them.
-            # TODO: Only do this if we actually requested the 'name' field.
+        if has_name_elem and not kwargs['name']:
+            # When we request the 'DisplayName' property, some folders may still be returned with an empty value.
+            # Assign a default name to these folders.
             kwargs['name'] = cls.DISTINGUISHED_FOLDER_ID
         cls._clear(elem)
         folder_cls = cls
@@ -812,7 +1007,8 @@ class Folder(RegisterMixIn, SearchableMixIn):
             # Instead, search for a folder class using the localized name. If none are found, fall back to getting the
             # folder class by the "FolderClass" value.
             #
-            # The returned XML may contain neither folder class nor name. In that case, we default
+            # The returned XML may contain neither folder class nor name. In that case, we default to the generic
+            # Folder class.
             if kwargs['name']:
                 try:
                     # TODO: fld_class.LOCALIZED_NAMES is most definitely neither complete nor authoritative
@@ -851,39 +1047,37 @@ class Folder(RegisterMixIn, SearchableMixIn):
         return tuple(f for f in cls.FIELDS if f.name not in ('id', 'changekey') and f.supports_version(version))
 
     @classmethod
-    def get_distinguished(cls, root):
-        """Gets the distinguished folder for this folder class"""
-        if not cls.DISTINGUISHED_FOLDER_ID:
-            raise ValueError('Class %s must have a DISTINGUISHED_FOLDER_ID value' % cls)
-        folders = list(FolderCollection(
-            account=root.account,
-            folders=[cls(root=root, name=cls.DISTINGUISHED_FOLDER_ID, is_distinguished=True)]
-        ).get_folders()
-        )
+    def resolve(cls, account, folder):
+        # Resolve a single folder
+        folders = list(FolderCollection(account=account, folders=[folder]).resolve())
         if not folders:
-            raise ErrorFolderNotFound('Could not find distinguished folder %s' % cls.DISTINGUISHED_FOLDER_ID)
+            raise ErrorFolderNotFound('Could not find folder %r' % folder)
         if len(folders) != 1:
             raise ValueError('Expected result length 1, but got %s' % folders)
-        folder = folders[0]
-        if isinstance(folder, Exception):
-            raise folder
-        if folder.__class__ != cls:
-            raise ValueError("Expected 'folder' %r to be a %s instance" % (folder, cls))
-        return folder
+        f = folders[0]
+        if isinstance(f, Exception):
+            raise f
+        if f.__class__ != cls:
+            raise ValueError("Expected folder %r to be a %s instance" % (f, cls))
+        return f
+
+    @classmethod
+    def get_distinguished(cls, root):
+        """Gets the distinguished folder for this folder class"""
+        try:
+            return cls.resolve(
+                account=root.account,
+                folder=cls(root=root, name=cls.DISTINGUISHED_FOLDER_ID, is_distinguished=True)
+            )
+        except ErrorFolderNotFound:
+            raise ErrorFolderNotFound('Could not find distinguished folder %r' % cls.DISTINGUISHED_FOLDER_ID)
 
     def refresh(self):
         if not self.root:
             raise ValueError('%s must have a root' % self.__class__.__name__)
         if not self.id:
             raise ValueError('%s must have an ID' % self.__class__.__name__)
-        folders = list(FolderCollection(account=self.root.account, folders=[self]).get_folders())
-        if not folders:
-            raise ErrorFolderNotFound('Folder %s disappeared' % self)
-        if len(folders) != 1:
-            raise ValueError('Expected result length 1, but got %s' % folders)
-        fresh_folder = folders[0]
-        if isinstance(fresh_folder, Exception):
-            raise fresh_folder
+        fresh_folder = self.resolve(account=self.root.account, folder=self)
         if self.id != fresh_folder.id:
             raise ValueError('ID mismatch')
         # Apparently, the changekey may get updated
@@ -901,11 +1095,10 @@ class Folder(RegisterMixIn, SearchableMixIn):
             return self
 
         # Assume an exact match on the folder name in a shallow search will only return at most one folder
-        for f in FolderCollection(account=self.root.account, folders=[self]).find_folders(
-                q=Q(name=other), depth=SHALLOW
-        ):
-            return f
-        raise ErrorFolderNotFound("No subfolder with name '%s'" % other)
+        try:
+            return SingleFolderQuerySet(account=self.root.account, folder=self).depth(SHALLOW).get(name=other)
+        except DoesNotExist:
+            raise ErrorFolderNotFound("No subfolder with name '%s'" % other)
 
     def __truediv__(self, other):
         # Support the some_folder / 'child_folder' / 'child_of_child_folder' navigation syntax
@@ -1104,6 +1297,7 @@ class WellknownFolder(Folder):
 class AdminAuditLogs(WellknownFolder):
     DISTINGUISHED_FOLDER_ID = 'adminauditlogs'
     supported_from = EXCHANGE_2013
+    get_folder_allowed = False
 
 
 class ArchiveDeletedItems(WellknownFolder):
@@ -1266,6 +1460,10 @@ class ToDoSearch(WellknownFolder):
 
 class VoiceMail(WellknownFolder):
     DISTINGUISHED_FOLDER_ID = 'voicemail'
+    CONTAINER_CLASS = 'IPF.Note.Microsoft.Voicemail'
+    LOCALIZED_NAMES = {
+        None: (u'Voice Mail',),
+    }
 
 
 class NonDeleteableFolderMixin:
@@ -1290,15 +1488,22 @@ class AllItems(NonDeleteableFolderMixin, Folder):
     }
 
 
+class Audits(NonDeleteableFolderMixin, Folder):
+    LOCALIZED_NAMES = {
+        None: (u'Audits',),
+    }
+    get_folder_allowed = False
+
+
 class CalendarLogging(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
-        None: ('Calendar Logging',),
+        None: (u'Calendar Logging',),
     }
 
 
 class CommonViews(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
-        None: ('Common Views',),
+        None: (u'Common Views',),
     }
 
 
@@ -1309,15 +1514,30 @@ class ConversationSettings(NonDeleteableFolderMixin, Folder):
     }
 
 
+class DefaultFoldersChangeHistory(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPM.DefaultFolderHistoryItem'
+    LOCALIZED_NAMES = {
+        None: (u'DefaultFoldersChangeHistory',),
+    }
+
+
 class DeferredAction(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
-        None: ('Deferred Action',),
+        None: (u'Deferred Action',),
     }
 
 
 class ExchangeSyncData(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
         None: (u'ExchangeSyncData',),
+    }
+
+
+class Files(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.Files'
+
+    LOCALIZED_NAMES = {
+        'da_DK': (u'Filer',),
     }
 
 
@@ -1344,6 +1564,13 @@ class GALContacts(NonDeleteableFolderMixin, Contacts):
     }
 
 
+class GraphAnalytics(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.StoreItem.GraphAnalytics'
+    LOCALIZED_NAMES = {
+        None: (u'GraphAnalytics',),
+    }
+
+
 class Location(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
         None: (u'Location',),
@@ -1367,6 +1594,20 @@ class ParkedMessages(NonDeleteableFolderMixin, Folder):
     CONTAINER_CLASS = None
     LOCALIZED_NAMES = {
         None: (u'ParkedMessages',),
+    }
+
+
+class PassThroughSearchResults(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.StoreItem.PassThroughSearchResults'
+    LOCALIZED_NAMES = {
+        None: (u'Pass-Through Search Results',),
+    }
+
+
+class PdpProfileV2Secured(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.StoreItem.PdpProfileSecured'
+    LOCALIZED_NAMES = {
+        None: (u'PdpProfileV2Secured',),
     }
 
 
@@ -1403,6 +1644,20 @@ class Shortcuts(NonDeleteableFolderMixin, Folder):
     }
 
 
+class Signal(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.StoreItem.Signal'
+    LOCALIZED_NAMES = {
+        None: (u'Signal',),
+    }
+
+
+class SmsAndChatsSync(NonDeleteableFolderMixin, Folder):
+    CONTAINER_CLASS = 'IPF.SmsAndChatsSync'
+    LOCALIZED_NAMES = {
+        None: (u'SmsAndChatsSync',),
+    }
+
+
 class SpoolerQueue(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
         None: (u'Spooler Queue',),
@@ -1413,6 +1668,7 @@ class System(NonDeleteableFolderMixin, Folder):
     LOCALIZED_NAMES = {
         None: (u'System',),
     }
+    get_folder_allowed = False
 
 
 class TemporarySaves(NonDeleteableFolderMixin, Folder):
@@ -1486,25 +1742,21 @@ class RootOfHierarchy(Folder):
                 yield f
 
     @classmethod
-    def get_distinguished(cls, account):
+    def get_distinguished(cls, root):
+        raise NotImplementedError('Use get_distinguished_root() instead')
+
+    @classmethod
+    def get_distinguished_root(cls, account):
         """Gets the distinguished folder for this folder class"""
         if not cls.DISTINGUISHED_FOLDER_ID:
             raise ValueError('Class %s must have a DISTINGUISHED_FOLDER_ID value' % cls)
-        folders = list(FolderCollection(
-            account=account,
-            folders=[cls(account=account, name=cls.DISTINGUISHED_FOLDER_ID, is_distinguished=True)]
-        ).get_folders()
-        )
-        if not folders:
+        try:
+            return cls.resolve(
+                account=account,
+                folder=cls(account=account, name=cls.DISTINGUISHED_FOLDER_ID, is_distinguished=True)
+            )
+        except ErrorFolderNotFound:
             raise ErrorFolderNotFound('Could not find distinguished folder %s' % cls.DISTINGUISHED_FOLDER_ID)
-        if len(folders) != 1:
-            raise ValueError('Expected result length 1, but got %s' % folders)
-        folder = folders[0]
-        if isinstance(folder, Exception):
-            raise folder
-        if folder.__class__ != cls:
-            raise ValueError("Expected 'folder' %r to be a %s instance" % (folder, cls))
-        return folder
 
     def get_default_folder(self, folder_cls):
         # Returns the distinguished folder instance of type folder_cls belonging to this account. If no distinguished
@@ -1539,40 +1791,41 @@ class RootOfHierarchy(Folder):
             return self._subfolders
 
         # Map root, and all subfolders of root, at arbitrary depth by folder ID. First get distinguished folders, so we
-        # are sure to apply the correct Folder class, then fetch all subfolders of this root. AdminAuditLogs folder is
-        # not retrievable and makes the entire request fail.
+        # are sure to apply the correct Folder class, then fetch all subfolders of this root.
         folders_map = {self.id: self}
         distinguished_folders = [
             cls(root=self, name=cls.DISTINGUISHED_FOLDER_ID, is_distinguished=True)
             for cls in self.WELLKNOWN_FOLDERS
-            if cls != AdminAuditLogs and cls.supports_version(self.account.version)
+            if cls.get_folder_allowed and cls.supports_version(self.account.version)
         ]
-        try:
-            for f in FolderCollection(account=self.account, folders=distinguished_folders).get_folders():
-                if isinstance(f, (ErrorFolderNotFound, ErrorNoPublicFolderReplicaAvailable)):
-                    # This is just a distinguished folder the server does not have
-                    continue
-                if isinstance(f, ErrorInvalidOperation):
-                    # This is probably a distinguished folder the server does not have. We previously tested the exact
-                    # error message (f.value), but some Exchange servers return localized error messages, so that's not
-                    # possible to do reliably.
-                    continue
-                if isinstance(f, ErrorItemNotFound):
-                    # Another way of telling us that this is a distinguished folder the server does not have
-                    continue
-                if isinstance(f, Exception):
-                    raise f
-                folders_map[f.id] = f
-            for f in FolderCollection(account=self.account, folders=[self]).find_folders(depth=self.TRAVERSAL_DEPTH):
-                if isinstance(f, Exception):
-                    raise f
-                if f.id in folders_map:
-                    # Already exists. Probably a distinguished folder
-                    continue
-                folders_map[f.id] = f
-        except ErrorAccessDenied:
-            # We may not have GetFolder or FindFolder access
-            pass
+        for f in FolderCollection(account=self.account, folders=distinguished_folders).resolve():
+            if isinstance(f, (ErrorFolderNotFound, ErrorNoPublicFolderReplicaAvailable)):
+                # This is just a distinguished folder the server does not have
+                continue
+            if isinstance(f, ErrorInvalidOperation):
+                # This is probably a distinguished folder the server does not have. We previously tested the exact
+                # error message (f.value), but some Exchange servers return localized error messages, so that's not
+                # possible to do reliably.
+                continue
+            if isinstance(f, ErrorItemNotFound):
+                # Another way of telling us that this is a distinguished folder the server does not have
+                continue
+            if isinstance(f, ErrorAccessDenied):
+                # We may not have GetFolder access, either to this folder or at all
+                continue
+            if isinstance(f, Exception):
+                raise f
+            folders_map[f.id] = f
+        for f in SingleFolderQuerySet(account=self.account, folder=self).depth(self.TRAVERSAL_DEPTH).all():
+            if isinstance(f, ErrorAccessDenied):
+                # We may not have FindFolder access, or GetFolder access, either to this folder or at all
+                continue
+            if isinstance(f, Exception):
+                raise f
+            if f.id in folders_map:
+                # Already exists. Probably a distinguished folder
+                continue
+            folders_map[f.id] = f
         self._subfolders = folders_map
         return folders_map
 
@@ -1582,10 +1835,12 @@ class RootOfHierarchy(Folder):
         fld_id_elem = elem.find(FolderId.response_tag())
         fld_id = fld_id_elem.get(FolderId.ID_ATTR)
         changekey = fld_id_elem.get(FolderId.CHANGEKEY_ATTR)
+        # Check for 'DisplayName' element before collecting kwargs because because that clears the elements
+        has_name_elem = elem.find(cls.get_field_by_fieldname('name').response_tag()) is not None
         kwargs = {f.name: f.from_xml(elem=elem, account=account) for f in cls.supported_fields()}
-        if not kwargs['name']:
-            # Some folders are returned with an empty 'DisplayName' element. Assign a default name to them.
-            # TODO: Only do this if we actually requested the 'name' field.
+        if has_name_elem and not kwargs['name']:
+            # When we request the 'DisplayName' property, some folders may still be returned with an empty value.
+            # Assign a default name to these folders.
             kwargs['name'] = cls.DISTINGUISHED_FOLDER_ID
         cls._clear(elem)
         return cls(account=account, id=fld_id, changekey=changekey, **kwargs)
@@ -1725,7 +1980,7 @@ class PublicFoldersRoot(RootOfHierarchy):
 
         children_map = {}
         try:
-            for f in FolderCollection(account=self.account, folders=[folder]).find_folders(depth=self.TRAVERSAL_DEPTH):
+            for f in SingleFolderQuerySet(account=self.account, folder=folder).depth(depth=self.TRAVERSAL_DEPTH).all():
                 if isinstance(f, Exception):
                     raise f
                 children_map[f.id] = f
@@ -1760,23 +2015,31 @@ class ArchiveRoot(RootOfHierarchy):
 NON_DELETEABLE_FOLDERS = [
     AllContacts,
     AllItems,
+    Audits,
     CalendarLogging,
     CommonViews,
     ConversationSettings,
+    DefaultFoldersChangeHistory,
     DeferredAction,
     ExchangeSyncData,
     FreebusyData,
+    Files,
     Friends,
     GALContacts,
+    GraphAnalytics,
     Location,
     MailboxAssociations,
     MyContactsExtended,
     ParkedMessages,
+    PassThroughSearchResults,
+    PdpProfileV2Secured,
     Reminders,
     RSSFeeds,
     Schedule,
     Sharing,
     Shortcuts,
+    Signal,
+    SmsAndChatsSync,
     SpoolerQueue,
     System,
     TemporarySaves,

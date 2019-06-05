@@ -13,7 +13,7 @@ from six import text_type, string_types
 
 from .fields import SubField, TextField, EmailAddressField, ChoiceField, DateTimeField, EWSElementField, MailboxField, \
     Choice, BooleanField, IdField, ExtendedPropertyField, IntegerField, TimeField, EnumField, CharField, EmailField, \
-    EWSElementListField, EnumListField, FreeBusyStatusField, WEEKDAY_NAMES, FieldPath, Field
+    EWSElementListField, EnumListField, FreeBusyStatusField, UnknownEntriesField, WEEKDAY_NAMES, FieldPath, Field
 from .util import get_xml_attr, create_element, set_xml_value, value_to_xml_text, MNS, TNS
 from .version import EXCHANGE_2013
 
@@ -127,8 +127,8 @@ class EWSElement(object):
     def _clear(elem):
         # Clears an XML element to reduce memory consumption
         elem.clear()
-        while elem.getprevious() is not None:
-            del elem.getparent()[0]
+        # Don't attempt to clean up previous siblings. We may not have parsed them yet.
+        elem.getparent().remove(elem)
 
     @classmethod
     def from_xml(cls, elem, account):
@@ -251,14 +251,23 @@ class EWSElement(object):
                 for k, v in state.items():
                     setattr(self, k, v)
 
+    def _field_vals(self):
+        field_vals = []  # Keep sorting
+        for f in self.FIELDS:
+            val = getattr(self, f.name)
+            if isinstance(f, EnumField) and isinstance(val, int):
+                val = f.as_string(val)
+            field_vals.append((f.name, val))
+        return field_vals
+
     def __str__(self):
         return self.__class__.__name__ + '(%s)' % ', '.join(
-            '%s=%s' % (f.name, repr(getattr(self, f.name))) for f in self.FIELDS if getattr(self, f.name) is not None
+            '%s=%r' % (name, val) for name, val in self._field_vals() if val is not None
         )
 
     def __repr__(self):
         return self.__class__.__name__ + '(%s)' % ', '.join(
-            '%s=%s' % (f.name, repr(getattr(self, f.name))) for f in self.FIELDS
+            '%s=%r' % (name, val) for name, val in self._field_vals()
         )
 
 
@@ -271,7 +280,7 @@ class MessageHeader(EWSElement):
         SubField('value'),
     ]
 
-    __slots__ = ('name', 'value')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class ItemId(EWSElement):
@@ -286,7 +295,7 @@ class ItemId(EWSElement):
         IdField('changekey', field_uri=CHANGEKEY_ATTR, is_required=False),
     ]
 
-    __slots__ = ('id', 'changekey')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def __init__(self, *args, **kwargs):
         if not kwargs:
@@ -380,7 +389,7 @@ class Mailbox(EWSElement):
         EWSElementField('item_id', value_cls=ItemId, is_read_only=True),
     ]
 
-    __slots__ = ('name', 'email_address', 'routing_type', 'mailbox_type', 'item_id')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def clean(self, version=None):
         super(Mailbox, self).clean(version=version)
@@ -412,7 +421,7 @@ class AvailabilityMailbox(EWSElement):
         ChoiceField('routing_type', field_uri='RoutingType', choices={Choice('SMTP')}, default='SMTP'),
     ]
 
-    __slots__ = ('name', 'email_address', 'routing_type')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def __hash__(self):
         # Exchange may add 'name' on insert. We're satisfied if the email address matches.
@@ -431,7 +440,7 @@ class Email(AvailabilityMailbox):
     # MSDN: https://msdn.microsoft.com/en-us/library/office/aa565868(v=exchg.150).aspx
     ELEMENT_NAME = 'Email'
 
-    __slots__ = ('name', 'email_address', 'routing_type')
+    __slots__ = AvailabilityMailbox.__slots__
 
     def __hash__(self):
         # Exchange may add 'name' on insert. We're satisfied if the email address matches.
@@ -449,7 +458,7 @@ class MailboxData(EWSElement):
         BooleanField('exclude_conflicts', field_uri='ExcludeConflicts'),
     ]
 
-    __slots__ = ('email', 'attendee_type', 'exclude_conflicts')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def __hash__(self):
         # Exchange may add 'name' on insert. We're satisfied if the email address matches.
@@ -464,7 +473,7 @@ class TimeWindow(EWSElement):
         DateTimeField('end', field_uri='EndTime', is_required=True),
     ]
 
-    __slots__ = ('start', 'end')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class FreeBusyViewOptions(EWSElement):
@@ -480,7 +489,7 @@ class FreeBusyViewOptions(EWSElement):
                     is_required=True),  # Choice('None') is also valid, but only for responses
     ]
 
-    __slots__ = ('time_window', 'merged_free_busy_interval', 'requested_view')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class Attendee(EWSElement):
@@ -496,7 +505,7 @@ class Attendee(EWSElement):
         DateTimeField('last_response_time', field_uri='LastResponseTime'),
     ]
 
-    __slots__ = ('mailbox', 'response_type', 'last_response_time')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def __hash__(self):
         # TODO: maybe take 'response_type' and 'last_response_time' into account?
@@ -514,7 +523,7 @@ class TimeZoneTransition(EWSElement):
         # 'Year' is not implemented yet
     ]
 
-    __slots__ = ('bias', 'time', 'occurrence', 'iso_month', 'weekday')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     @classmethod
     def from_xml(cls, elem, account):
@@ -555,7 +564,7 @@ class TimeZone(EWSElement):
         EWSElementField('daylight_time', value_cls=DaylightTime),
     ]
 
-    __slots__ = ('bias', 'standard_time', 'daylight_time')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def to_server_timezone(self, timezones, for_year):
         """Returns the Microsoft timezone ID corresponding to this timezone. There may not be a match at all, and there
@@ -729,9 +738,12 @@ class FreeBusyView(EWSElement):
     @classmethod
     def from_xml(cls, elem, account):
         kwargs = {}
+        working_hours_elem = elem.find('{%s}WorkingHours' % TNS)
         for f in cls.FIELDS:
             if f.name in ['working_hours', 'working_hours_timezone']:
-                kwargs[f.name] = f.from_xml(elem=elem.find('{%s}WorkingHours' % TNS), account=account)
+                if working_hours_elem is None:
+                    continue
+                kwargs[f.name] = f.from_xml(elem=working_hours_elem, account=account)
                 continue
             kwargs[f.name] = f.from_xml(elem=elem, account=account)
         cls._clear(elem)
@@ -783,11 +795,99 @@ class Member(EWSElement):
         }, default='Normal'),
     ]
 
-    __slots__ = ('mailbox', 'status')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def __hash__(self):
         # TODO: maybe take 'status' into account?
         return hash(self.mailbox)
+
+
+class UserId(EWSElement):
+    # MSDN: https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/userid
+    ELEMENT_NAME = 'UserId'
+
+    FIELDS = [
+        CharField('sid', field_uri='SID'),
+        EmailAddressField('primary_smtp_address', field_uri='PrimarySmtpAddress'),
+        CharField('display_name', field_uri='DisplayName'),
+        ChoiceField('distinguished_user', field_uri='DistinguishedUser', choices={
+            Choice('Default'), Choice('Anonymous')
+        }),
+        CharField('external_user_identity', field_uri='ExternalUserIdentity'),
+    ]
+
+    __slots__ = tuple(f.name for f in FIELDS)
+
+
+class Permission(EWSElement):
+    # MSDN: https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/permission
+    ELEMENT_NAME = 'Permission'
+
+    PERMISSION_ENUM = {Choice('None'), Choice('Owned'), Choice('All')}
+    FIELDS = [
+        BooleanField('can_create_items', field_uri='CanCreateItems', default=False),
+        BooleanField('can_create_subfolders', field_uri='CanCreateSubfolders', default=False),
+        BooleanField('is_folder_owner', field_uri='IsFolderOwner', default=False),
+        BooleanField('is_folder_visible', field_uri='IsFolderVisible', default=False),
+        BooleanField('is_folder_contact', field_uri='IsFolderContact', default=False),
+        ChoiceField('edit_items', field_uri='EditItems', choices=PERMISSION_ENUM, default='None'),
+        ChoiceField('delete_items', field_uri='DeleteItems', choices=PERMISSION_ENUM, default='None'),
+        ChoiceField('permission_level', field_uri='PermissionLevel', choices={
+            Choice('None'), Choice('Owner'), Choice('PublishingEditor'), Choice('Editor'), Choice('PublishingAuthor'),
+            Choice('Author'), Choice('NoneditingAuthor'), Choice('Reviewer'), Choice('Contributor'), Choice('Custom')
+        }, default='None'),
+        ChoiceField('read_items', field_uri='ReadItems', choices={
+            Choice('None'), Choice('FullDetails')
+        }, default='None'),
+        EWSElementField('user_id', field_uri='UserId', value_cls=UserId, is_required=True)
+    ]
+
+    __slots__ = tuple(f.name for f in FIELDS)
+
+
+class CalendarPermission(EWSElement):
+    # MSDN: https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/calendarpermission
+    ELEMENT_NAME = 'Permission'
+
+    PERMISSION_ENUM = {Choice('None'), Choice('Owned'), Choice('All')}
+    FIELDS = [
+        ChoiceField('calendar_permission_level', field_uri='CalendarPermissionLevel', choices={
+            Choice('None'), Choice('Owner'), Choice('PublishingEditor'), Choice('Editor'), Choice('PublishingAuthor'),
+            Choice('Author'), Choice('NoneditingAuthor'), Choice('Reviewer'), Choice('Contributor'),
+            Choice('FreeBusyTimeOnly'), Choice('FreeBusyTimeAndSubjectAndLocation'), Choice('Custom')
+        }, default='None'),
+        BooleanField('can_create_items', field_uri='CanCreateItems', default=False),
+        BooleanField('can_create_subfolders', field_uri='CanCreateSubfolders', default=False),
+        BooleanField('is_folder_owner', field_uri='IsFolderOwner', default=False),
+        BooleanField('is_folder_visible', field_uri='IsFolderVisible', default=False),
+        BooleanField('is_folder_contact', field_uri='IsFolderContact', default=False),
+        ChoiceField('edit_items', field_uri='EditItems', choices=PERMISSION_ENUM, default='None'),
+        ChoiceField('delete_items', field_uri='DeleteItems', choices=PERMISSION_ENUM, default='None'),
+        ChoiceField('read_items', field_uri='ReadItems', choices={
+            Choice('None'), Choice('FullDetails')
+        }, default='None'),
+        EWSElementField('user_id', field_uri='UserId', value_cls=UserId, is_required=True)
+    ]
+
+    __slots__ = tuple(f.name for f in FIELDS)
+
+
+class PermissionSet(EWSElement):
+    # MSDN:
+    # https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/permissionset-permissionsettype
+    # and
+    # https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/permissionset-calendarpermissionsettype
+
+    # For simplicity, we implement the two distinct but equally names elements as one class.
+    ELEMENT_NAME = 'PermissionSet'
+
+    FIELDS = [
+        EWSElementListField('permissions', field_uri='Permissions', value_cls=Permission),
+        EWSElementListField('calendar_permissions', field_uri='CalendarPermissions', value_cls=CalendarPermission),
+        UnknownEntriesField('unknown_entries', field_uri='UnknownEntries'),
+    ]
+
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class EffectiveRights(EWSElement):

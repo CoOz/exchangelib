@@ -17,13 +17,13 @@ class IndexedElement(EWSElement):
 
 
 class SingleFieldIndexedElement(IndexedElement):
-    __slots__ = ('label',)
+    __slots__ = IndexedElement.__slots__
 
     @classmethod
     def value_field(cls, version=None):
         fields = cls.supported_fields(version=version)
         if len(fields) != 1:
-            raise ValueError('This class must have only one field (found %s)' % fields)
+            raise ValueError('This class must have only one field (found %s)' % (fields,))
         return fields[0]
 
 
@@ -37,7 +37,7 @@ class EmailAddress(SingleFieldIndexedElement):
         EmailSubField('email'),
     ]
 
-    __slots__ = ('label', 'email')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class PhoneNumber(SingleFieldIndexedElement):
@@ -53,11 +53,11 @@ class PhoneNumber(SingleFieldIndexedElement):
         SubField('phone_number'),
     ]
 
-    __slots__ = ('label', 'phone_number')
+    __slots__ = tuple(f.name for f in FIELDS)
 
 
 class MultiFieldIndexedElement(IndexedElement):
-    __slots__ = ('label',)
+    __slots__ = IndexedElement.__slots__
 
 
 class PhysicalAddress(MultiFieldIndexedElement):
@@ -74,7 +74,7 @@ class PhysicalAddress(MultiFieldIndexedElement):
         NamedSubField('zipcode', field_uri='PostalCode'),
     ]
 
-    __slots__ = ('label', 'street', 'city', 'state', 'country', 'zipcode')
+    __slots__ = tuple(f.name for f in FIELDS)
 
     def clean(self, version=None):
         # pylint: disable=access-member-before-definition

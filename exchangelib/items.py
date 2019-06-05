@@ -13,7 +13,7 @@ from .fields import BooleanField, IntegerField, DecimalField, Base64Field, TextF
     PhysicalAddressField, ExtendedPropertyField, AttachmentField, RecurrenceField, MailboxField, MailboxListField, \
     AttendeesField, Choice, OccurrenceField, OccurrenceListField, MemberListField, EWSElementField, \
     EffectiveRightsField, TimeZoneField, CultureField, IdField, CharField, TextListField, EnumAsIntField, \
-    EmailAddressField, FreeBusyStatusField, ReferenceItemIdField, AssociatedCalendarItemIdField
+    EmailAddressField, FreeBusyStatusField, ReferenceItemIdField, AssociatedCalendarItemIdField, MimeContentField
 from .properties import EWSElement, ItemId, ConversationId, ParentFolderId, Attendee, ReferenceItemId, \
     AssociatedCalendarItemId, PersonaId, InvalidField
 from .recurrence import FirstOccurrence, LastOccurrence, Occurrence, DeletedOccurrence
@@ -134,7 +134,7 @@ class Item(RegisterMixIn):
 
     # FIELDS is an ordered list of attributes supported by this item class
     FIELDS = [
-        Base64Field('mime_content', field_uri='item:MimeContent', is_read_only_after_send=True),
+        MimeContentField('mime_content', field_uri='item:MimeContent', is_read_only_after_send=True),
         IdField('id', field_uri=ItemId.ID_ATTR, is_read_only=True),
         IdField('changekey', field_uri=ItemId.CHANGEKEY_ATTR, is_read_only=True),
         EWSElementField('parent_folder_id', field_uri='item:ParentFolderId', value_cls=ParentFolderId,
@@ -1149,10 +1149,7 @@ class MeetingResponse(BaseMeetingItem):
     MSDN: https://msdn.microsoft.com/en-us/library/office/aa564337(v=exchg.150).aspx
     """
     ELEMENT_NAME = 'MeetingResponse'
-    FIELDS = Message.FIELDS + [
-        MailboxField('received_by', field_uri='message:ReceivedBy', is_read_only=True),
-        MailboxField('received_representing', field_uri='message:ReceivedRepresenting', is_read_only=True),
-    ]
+    FIELDS = list(Message.FIELDS)
 
 
 class MeetingCancellation(BaseMeetingItem):

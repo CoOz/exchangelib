@@ -8,9 +8,9 @@ from future.utils import python_2_unicode_compatible, PY2
 from six import text_type
 
 from .errors import TransportError, ErrorInvalidSchemaVersionForMailboxVersion, ErrorInvalidServerVersion, \
-    ResponseMessageError
-from .transport import get_auth_instance
-from .util import is_xml, to_xml, TNS, SOAPNS, ParseError
+    ErrorIncorrectSchemaVersion, ResponseMessageError
+from .transport import get_auth_instance, DEFAULT_HEADERS
+from .util import is_xml, to_xml, TNS, SOAPNS, ParseError, CONNECTION_ERRORS
 
 log = logging.getLogger(__name__)
 
@@ -222,7 +222,11 @@ class Version(object):
         # Some servers send an empty response if we send 'Connection': 'close' header
         from .protocol import BaseProtocol
         with BaseProtocol.raw_session() as s:
-            r = s.get(url=types_url, auth=auth, allow_redirects=False, stream=False)
+            try:
+                r = s.get(url=types_url, headers=DEFAULT_HEADERS.copy(), auth=auth, allow_redirects=False,
+                          timeout=BaseProtocol.TIMEOUT)
+            except CONNECTION_ERRORS as e:
+                raise TransportError(str(e))
         log.debug('Request headers: %s', r.request.headers)
         log.debug('Response code: %s', r.status_code)
         log.debug('Response headers: %s', r.headers)
@@ -245,7 +249,7 @@ class Version(object):
         protocol.version = Version(build=None, api_version=hint or API_VERSIONS[-1])
         try:
             list(ResolveNames(protocol=protocol).call(unresolved_entries=[protocol.credentials.username]))
-        except (ErrorInvalidSchemaVersionForMailboxVersion, ErrorInvalidServerVersion):
+        except (ErrorInvalidSchemaVersionForMailboxVersion, ErrorInvalidServerVersion, ErrorIncorrectSchemaVersion):
             raise TransportError('Unable to guess version')
         except ResponseMessageError:
             # We survived long enough to get a new version

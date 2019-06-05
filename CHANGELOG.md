@@ -3,6 +3,26 @@ Change Log
 
 HEAD
 ----
+`Item.mime_content` is now a text field instead of a binary field. Encoding and
+decoding is done automatically.
+
+
+1.12.5
+------
+-   Bugfix release.
+
+
+1.12.4
+------
+- Fix bug that left out parts of the folder hierarchy when traversing `account.root`.
+- Fix bug that did not properly find all attachments if an item has a mix of item
+  and file attachments.
+
+
+1.12.3
+------
+-   Add support for reading and writing `PermissionSet` field on folders.
+-   Add support for Exchange 2019 build IDs.
 
 
 1.12.2
